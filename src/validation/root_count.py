@@ -4,9 +4,14 @@ src/validation/root_count.py
 Verify that the parsed root and entry counts are within expected ranges for
 the Hans Wehr 4th edition:
   - Roots: ~13,000  (tolerance ±5%)
-  - Entries: ~60,000 (tolerance ±10%)
+  - Entries: ~60,000 (tolerance ±15%)
   - No root should have zero entries
   - Distribution of entries per root should look roughly normal (1–50)
+
+NOTE on entry tolerance: different PDF sources and editions vary significantly
+in how entries are split across lines and pages. ±15% is intentionally loose
+for the first import pass. Tighten it (e.g. to ±5%) once you have run the
+pipeline against your specific copy and know what it actually yields.
 
 Usage:
   python -m src.validation.root_count --db data/hans_wehr.db
@@ -35,7 +40,7 @@ console = Console()
 EXPECTED_ROOTS = 13_000
 EXPECTED_ENTRIES = 60_000
 ROOT_TOLERANCE = 0.05    # ±5%
-ENTRY_TOLERANCE = 0.10   # ±10%
+ENTRY_TOLERANCE = 0.15   # ±15% — intentionally loose; tighten after first full run
 
 
 def _check(label: str, actual: int, expected: int, tolerance: float) -> tuple[bool, str]:

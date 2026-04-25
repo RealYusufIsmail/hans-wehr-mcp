@@ -36,11 +36,16 @@ dev = [
 ]
 
 [project.scripts]
-# Main pipeline commands
+# Step 0 — pre-flight check (run before anything else)
+hans-probe    = "scripts.probe_pdf:app"
+# Main pipeline commands (steps 1–4)
 hans-extract  = "hans_wehr.pipeline.extract:app"
 hans-parse    = "hans_wehr.pipeline.parser:app"
 hans-refine   = "hans_wehr.pipeline.llm_refine:app"
 hans-import   = "scripts.import_db:app"
+# Step 5 — post-import cross-reference resolution
+hans-resolve-xrefs = "scripts.resolve_xrefs:app"
+# Step 6 — accuracy validation
 hans-validate = "hans_wehr.validation.report:app"
 # MCP server entry point
 hans-mcp      = "hans_wehr.mcp.server:main"
