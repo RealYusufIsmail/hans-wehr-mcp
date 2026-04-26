@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -28,10 +29,32 @@ from typing import Any
 #   U+0670 ARABIC LETTER SUPERSCRIPT ALEF
 _DIACRITIC_RE = re.compile(r"[\u064B-\u065F\u0670]")
 
+# Latin combining diacritics (U+0300 COMBINING GRAVE … U+036F COMBINING LATIN SMALL LETTER X)
+# Used to normalise Hans Wehr transliteration: ā→a, ī→i, ū→u, ḥ→h, ṭ→t, ẓ→z, etc.
+_LATIN_COMBINING_RE = re.compile(r"[\u0300-\u036F]")
+
 
 def strip_diacritics(text: str) -> str:
     """Remove Arabic tashkeel from *text*, returning the bare consonantal form."""
     return _DIACRITIC_RE.sub("", text)
+
+
+def normalise_transliteration(text: str) -> str:
+    """Strip Latin combining diacritics from a Hans Wehr transliteration string.
+
+    Converts academic ALA-LC transliteration to plain ASCII so users can type
+    without special characters:
+        "kātaba"  → "kataba"
+        "ḥusn"    → "husn"
+        "ṭalab"   → "talab"
+        "maʿrūf"  → "maʿruf"   (ʿ ayin is not a combining mark; kept as-is)
+
+    Uses Unicode NFD decomposition to separate base characters from their
+    combining marks, then strips the combining marks (U+0300–U+036F).
+    Result is lowercased and stripped of leading/trailing whitespace.
+    """
+    nfd = unicodedata.normalize("NFD", text)
+    return _LATIN_COMBINING_RE.sub("", nfd).lower().strip()
 
 
 def normalise_arabic_query(query: str) -> str:
@@ -74,10 +97,27 @@ def get_root_by_arabic(conn: sqlite3.Connection, arabic: str) -> sqlite3.Row | N
 
 
 def get_root_by_transliteration(conn: sqlite3.Connection, translit: str) -> sqlite3.Row | None:
-    """Fetch a root by its transliteration (case-insensitive)."""
-    return conn.execute(
+    """Fetch a root by its transliteration.
+
+    Two-step lookup:
+    1. Exact case-insensitive match on the stored transliteration  (e.g. "kātaba").
+    2. Normalised ASCII match on transliteration_ascii             (e.g. "kataba").
+
+    This lets users type without special diacritic characters and still find roots.
+    """
+    t = translit.strip()
+    row = conn.execute(
         "SELECT * FROM roots WHERE lower(transliteration) = lower(?)",
-        (translit.strip(),),
+        (t,),
+    ).fetchone()
+    if row is not None:
+        return row
+
+    # Fallback: strip Latin combining marks (ā→a, ḥ→h, etc.) and try ascii column
+    ascii_form = normalise_transliteration(t)
+    return conn.execute(
+        "SELECT * FROM roots WHERE transliteration_ascii = ?",
+        (ascii_form,),
     ).fetchone()
 
 
@@ -227,6 +267,72 @@ def search_english(
         (fts_query, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def search_transliteration(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Search entries by transliteration using FTS5.
+
+    Works with or without diacritics — the FTS tokenizer strips combining marks
+    on both the stored text and the query, so "kataba" matches "kātaba".
+
+    Uses the FTS5 column filter syntax to restrict matching to the
+    transliteration column only (avoids Arabic false-positives).
+    """
+    q = query.strip().lower()
+    # FTS5 column filter: "transliteration : <term>"
+    fts_query = f'transliteration : "{q}"' if " " in q else f"transliteration : {q}"
+    rows = conn.execute(
+        """
+        SELECT
+            e.id,
+            e.arabic,
+            e.arabic_unvoweled,
+            e.transliteration,
+            e.transliteration_ascii,
+            e.part_of_speech,
+            e.definition,
+            e.confidence,
+            e.page_number,
+            snippet(entries_arabic_fts, 1, '<b>', '</b>', '…', 10) AS match_snippet
+        FROM entries_arabic_fts fts
+        JOIN entries e ON e.id = fts.entry_id
+        WHERE entries_arabic_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?
+        """,
+        (fts_query, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def search_roots_by_transliteration(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 10,
+) -> list[sqlite3.Row]:
+    """Search roots by transliteration using roots_fts.
+
+    Handles casual input (no diacritics) because the FTS tokenizer applies
+    remove_diacritics to both stored text and the query.
+    """
+    q = query.strip().lower()
+    fts_query = f'transliteration : "{q}"' if " " in q else f"transliteration : {q}"
+    rows = conn.execute(
+        """
+        SELECT r.*
+        FROM roots_fts fts
+        JOIN roots r ON r.id = fts.root_id
+        WHERE roots_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?
+        """,
+        (fts_query, limit),
+    ).fetchall()
+    return rows
 
 
 # ---------------------------------------------------------------------------

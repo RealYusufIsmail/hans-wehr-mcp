@@ -34,6 +34,8 @@ import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
+from hans_wehr.db.queries import normalise_transliteration
+
 app = typer.Typer(help="Import parsed entries into SQLite.")
 console = Console()
 log = logging.getLogger(__name__)
@@ -85,17 +87,21 @@ def _upsert_root(conn: sqlite3.Connection, entry: dict) -> int:
         # Update transliteration if it was empty before
         if root_translit:
             conn.execute(
-                "UPDATE roots SET transliteration = ? WHERE id = ? AND transliteration = ''",
-                (root_translit, existing["id"]),
+                """
+                UPDATE roots
+                SET transliteration = ?, transliteration_ascii = ?
+                WHERE id = ? AND transliteration = ''
+                """,
+                (root_translit, normalise_transliteration(root_translit), existing["id"]),
             )
         return existing["id"]
 
     cursor = conn.execute(
         """
-        INSERT INTO roots (arabic, arabic_unvoweled, transliteration, page_number)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO roots (arabic, arabic_unvoweled, transliteration, transliteration_ascii, page_number)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (root_arabic, root_unvoweled, root_translit, root_page),
+        (root_arabic, root_unvoweled, root_translit, normalise_transliteration(root_translit), root_page),
     )
     return cursor.lastrowid
 
@@ -114,19 +120,23 @@ def _insert_entry(conn: sqlite3.Connection, root_id: int, entry: dict) -> int | 
     confidence = float(entry.get("confidence", 1.0))
     needs_review = 1 if entry.get("needs_review") else 0
 
+    raw_translit = entry.get("transliteration") or None
+    translit_ascii = normalise_transliteration(raw_translit) if raw_translit else None
+
     cursor = conn.execute(
         """
         INSERT INTO entries (
-            root_id, arabic, arabic_unvoweled, transliteration,
+            root_id, arabic, arabic_unvoweled, transliteration, transliteration_ascii,
             part_of_speech, verb_form, plural_forms, definition,
             grammar_notes, page_number, confidence, needs_review
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             root_id,
             arabic,
             entry.get("arabic_unvoweled", "") or arabic,
-            entry.get("transliteration") or None,
+            raw_translit,
+            translit_ascii,
             entry.get("part_of_speech") or None,
             entry.get("verb_form") or None,
             plural_json,
@@ -187,15 +197,16 @@ def _insert_xrefs(conn: sqlite3.Connection, entry_id: int, entry: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _rebuild_fts(conn: sqlite3.Connection) -> None:
-    """Populate FTS5 tables from the entries table.
+    """Populate FTS5 tables from the entries and roots tables.
 
     The triggers keep FTS in sync for incremental updates, but a full rebuild
     after bulk import is faster and safer.
     """
     log.info("Rebuilding FTS5 indexes…")
-    # Delete existing FTS content
+
     conn.execute("DELETE FROM entries_arabic_fts")
     conn.execute("DELETE FROM entries_english_fts")
+    conn.execute("DELETE FROM roots_fts")
 
     conn.execute(
         """
@@ -207,6 +218,12 @@ def _rebuild_fts(conn: sqlite3.Connection) -> None:
         """
         INSERT INTO entries_english_fts (rowid, definition, grammar_notes, entry_id)
         SELECT id, definition, grammar_notes, id FROM entries
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO roots_fts (rowid, arabic_unvoweled, transliteration, transliteration_ascii, root_id)
+        SELECT id, arabic_unvoweled, transliteration, transliteration_ascii, id FROM roots
         """
     )
     conn.commit()

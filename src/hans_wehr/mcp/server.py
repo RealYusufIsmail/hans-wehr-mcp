@@ -49,6 +49,8 @@ from hans_wehr.db.queries import (
     parse_plural_forms,
     search_arabic,
     search_english,
+    search_transliteration,
+    search_roots_by_transliteration,
     strip_diacritics,
 )
 
@@ -185,6 +187,33 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["letter"],
             },
         ),
+        types.Tool(
+            name="search_transliteration",
+            description=(
+                "Search dictionary entries by their Hans Wehr transliteration. "
+                "Accepts plain ASCII (e.g. 'kataba', 'husn', 'kitab') — diacritics like "
+                "macrons and underdots are optional. "
+                "Use this when the user types a word in Latin/English letters rather than Arabic script."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Transliteration to search for. Examples: 'kataba', 'kitab', "
+                            "'husn', 'kātaba' (with or without diacritics)."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default 20, max 100).",
+                        "default": 20,
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
     ]
 
 
@@ -264,6 +293,8 @@ def _dispatch(name: str, arguments: dict) -> str:
         return _tool_search_arabic(arguments)
     if name == "search_english":
         return _tool_search_english(arguments)
+    if name == "search_transliteration":
+        return _tool_search_transliteration(arguments)
     if name == "get_entry":
         return _tool_get_entry(arguments)
     if name == "list_roots":
@@ -281,18 +312,25 @@ def _tool_lookup_root(args: dict) -> str:
         return _error_response("'root' argument is required")
 
     with _db() as conn:
-        # Try Arabic lookup first (strip diacritics for normalised match)
+        # 1. Try Arabic script lookup (strips diacritics internally)
         root_row = get_root_by_arabic(conn, raw_root)
 
-        # Fall back to transliteration lookup
+        # 2. Try exact + ASCII-normalised transliteration lookup
         if root_row is None:
             root_row = get_root_by_transliteration(conn, raw_root)
 
-        # Still not found — try stripping to bare consonants and retrying
+        # 3. Bare Arabic consonants (strip diacritics and retry Arabic lookup)
         if root_row is None:
             bare = strip_diacritics(raw_root)
             if bare != raw_root:
                 root_row = get_root_by_arabic(conn, bare)
+
+        # 4. FTS fallback — handles partial matches and casual Latin spelling
+        #    e.g. "katab" matching "kātaba", "ktb" matching Arabic unvoweled form
+        if root_row is None:
+            fts_hits = search_roots_by_transliteration(conn, raw_root, limit=1)
+            if fts_hits:
+                root_row = fts_hits[0]
 
         if root_row is None:
             return _not_found_response(raw_root)
@@ -388,6 +426,34 @@ def _tool_get_entry(args: dict) -> str:
         ]
 
     return json.dumps(entry_dict, ensure_ascii=False, indent=2)
+
+
+def _tool_search_transliteration(args: dict) -> str:
+    query = args.get("query", "").strip()
+    if not query:
+        return _error_response("'query' argument is required")
+
+    limit = min(int(args.get("limit", 20)), 100)
+
+    with _db() as conn:
+        results = search_transliteration(conn, query, limit)
+
+    if not results:
+        return json.dumps(
+            {"results": [], "total": 0, "query": query,
+             "tip": "Try search_english for meaning-based lookup."},
+            ensure_ascii=False,
+        )
+
+    return json.dumps({
+        "results": results,
+        "total": len(results),
+        "query": query,
+        "note": (
+            "Matched against stored transliterations. "
+            "Diacritics (macrons, underdots) are optional in the query."
+        ),
+    }, ensure_ascii=False, indent=2)
 
 
 def _tool_list_roots(args: dict) -> str:

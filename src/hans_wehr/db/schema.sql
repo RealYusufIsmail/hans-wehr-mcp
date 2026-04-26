@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS roots (
     arabic_unvoweled    TEXT    NOT NULL,
     -- Academic transliteration per Hans Wehr convention (ḥ, ḫ, ṭ, ẓ, ā, ī, ū, …)
     transliteration     TEXT    NOT NULL,
+    -- ASCII-safe transliteration: Latin combining diacritics stripped (ā→a, ḥ→h, ṭ→t …)
+    -- Populated by import_db.py. Lets users type without special characters.
+    transliteration_ascii TEXT  NOT NULL DEFAULT '',
 
     -- PDF page number where this root heading first appears
     page_number         INTEGER NOT NULL,
@@ -32,9 +35,10 @@ CREATE TABLE IF NOT EXISTS roots (
     UNIQUE (arabic_unvoweled)
 );
 
-CREATE INDEX IF NOT EXISTS idx_roots_arabic_unvoweled ON roots (arabic_unvoweled);
-CREATE INDEX IF NOT EXISTS idx_roots_transliteration  ON roots (transliteration);
-CREATE INDEX IF NOT EXISTS idx_roots_page             ON roots (page_number);
+CREATE INDEX IF NOT EXISTS idx_roots_arabic_unvoweled    ON roots (arabic_unvoweled);
+CREATE INDEX IF NOT EXISTS idx_roots_transliteration     ON roots (transliteration);
+CREATE INDEX IF NOT EXISTS idx_roots_transliteration_asc ON roots (transliteration_ascii);
+CREATE INDEX IF NOT EXISTS idx_roots_page                ON roots (page_number);
 
 -- ---------------------------------------------------------------------------
 -- entries
@@ -53,6 +57,8 @@ CREATE TABLE IF NOT EXISTS entries (
 
     -- Academic transliteration
     transliteration     TEXT,
+    -- ASCII-safe transliteration for casual search (ā→a, ḥ→h, ṭ→t …)
+    transliteration_ascii TEXT,
 
     -- Grammatical part of speech
     -- Allowed values: verb | noun | adjective | adverb | particle | phrase | proper_noun
@@ -85,11 +91,12 @@ CREATE TABLE IF NOT EXISTS entries (
     created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_entries_root_id          ON entries (root_id);
-CREATE INDEX IF NOT EXISTS idx_entries_arabic_unvoweled ON entries (arabic_unvoweled);
-CREATE INDEX IF NOT EXISTS idx_entries_page             ON entries (page_number);
-CREATE INDEX IF NOT EXISTS idx_entries_needs_review     ON entries (needs_review) WHERE needs_review = 1;
-CREATE INDEX IF NOT EXISTS idx_entries_confidence       ON entries (confidence);
+CREATE INDEX IF NOT EXISTS idx_entries_root_id              ON entries (root_id);
+CREATE INDEX IF NOT EXISTS idx_entries_arabic_unvoweled     ON entries (arabic_unvoweled);
+CREATE INDEX IF NOT EXISTS idx_entries_transliteration_asc  ON entries (transliteration_ascii);
+CREATE INDEX IF NOT EXISTS idx_entries_page                 ON entries (page_number);
+CREATE INDEX IF NOT EXISTS idx_entries_needs_review         ON entries (needs_review) WHERE needs_review = 1;
+CREATE INDEX IF NOT EXISTS idx_entries_confidence           ON entries (confidence);
 
 -- ---------------------------------------------------------------------------
 -- cross_references
@@ -194,6 +201,41 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_english_fts USING fts5(
     content_rowid='id',
     tokenize='porter unicode61'  -- Porter stemming for English
 );
+
+-- Root full-text search (transliteration + arabic_unvoweled)
+-- Lets lookup_root("kataba") and list_roots("k") match via FTS even with diacritics.
+CREATE VIRTUAL TABLE IF NOT EXISTS roots_fts USING fts5(
+    arabic_unvoweled,
+    transliteration,
+    transliteration_ascii,
+    root_id UNINDEXED,
+    content='roots',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_roots_fts_insert
+    AFTER INSERT ON roots
+BEGIN
+    INSERT INTO roots_fts (rowid, arabic_unvoweled, transliteration, transliteration_ascii, root_id)
+    VALUES (NEW.id, NEW.arabic_unvoweled, NEW.transliteration, NEW.transliteration_ascii, NEW.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_roots_fts_delete
+    AFTER DELETE ON roots
+BEGIN
+    INSERT INTO roots_fts (roots_fts, rowid, arabic_unvoweled, transliteration, transliteration_ascii, root_id)
+    VALUES ('delete', OLD.id, OLD.arabic_unvoweled, OLD.transliteration, OLD.transliteration_ascii, OLD.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_roots_fts_update
+    AFTER UPDATE ON roots
+BEGIN
+    INSERT INTO roots_fts (roots_fts, rowid, arabic_unvoweled, transliteration, transliteration_ascii, root_id)
+    VALUES ('delete', OLD.id, OLD.arabic_unvoweled, OLD.transliteration, OLD.transliteration_ascii, OLD.id);
+    INSERT INTO roots_fts (rowid, arabic_unvoweled, transliteration, transliteration_ascii, root_id)
+    VALUES (NEW.id, NEW.arabic_unvoweled, NEW.transliteration, NEW.transliteration_ascii, NEW.id);
+END;
 
 -- Keep FTS tables in sync with entries table
 CREATE TRIGGER IF NOT EXISTS trg_entries_arabic_fts_insert
