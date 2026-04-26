@@ -56,3 +56,4 @@ htmlcov/
 # uv lock (commit the lock file for reproducibility)
 # uv.lock  # intentionally NOT ignored — commit this
 uv.lock
+*.sqlite

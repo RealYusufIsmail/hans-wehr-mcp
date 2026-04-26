@@ -405,11 +405,32 @@ When querying tools, you can use either Arabic script or transliteration.
 
 Run `hans-probe` first. If it reports `SCANNED`, use `hans-ocr` (macOS) followed by `hans-verify-ocr`, or OCRmyPDF directly (any OS) before running `hans-parse`.
 
+**"[tesseract] lots of diacritics — possibly poor OCR"**
+
+This is a Tesseract warning, not an error. It fires when Arabic text has heavy tashkeel (vowel marks). Tesseract's default `ara` model handles unvowelled Arabic well but is weaker on fully diacritised text like Hans Wehr headwords.
+
+Improve it by upgrading to the `tessdata_best` neural model:
+
+```bash
+# 1. Find your tessdata directory
+brew --prefix tesseract   # e.g. /opt/homebrew/opt/tesseract
+
+# 2. Download the high-accuracy Arabic model
+curl -L -o /opt/homebrew/share/tessdata/ara.traineddata \
+  https://github.com/tesseract-ocr/tessdata_best/raw/main/ara.traineddata
+```
+
+Re-run `hans-verify-ocr` — agreement scores will improve. Remaining bad pages are automatically routed to `hans-refine --local` for cleanup.
+
+**"page already has text! — rasterising text and running OCR anyway"**
+
+Harmless. Occurs when the PDF already has a partial text layer (even all-image PDFs can carry some metadata text). `--force-ocr` tells OCRmyPDF to ignore it and OCR the rendered image regardless. No action needed.
+
 **Low OCR agreement scores across many pages**
 
 If `hans-verify-ocr` shows average agreement below ~60%, check:
 - The PDF may have heavy tashkeel (diacritics) — both engines can struggle. This is expected; LLM refinement will clean up the worst entries.
-- Tesseract Arabic (`ara`) may need a newer `tessdata` model. Download `ara.traineddata` from [tesseract-ocr/tessdata_best](https://github.com/tesseract-ocr/tessdata_best) and place it in `$(brew --prefix tesseract)/share/tessdata/`.
+- Upgrade to `tessdata_best` as shown above.
 - Try `hans-verify-ocr --verbose` to see per-span debug output.
 
 **Ollama refuses to start / model not found**
