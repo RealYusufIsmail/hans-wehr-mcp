@@ -80,10 +80,10 @@ hans-mcp      = "hans_wehr.mcp.server:main"
 packages = ["src/hans_wehr", "scripts"]
 
 # ---------------------------------------------------------------------------
-# uv configuration
+# Dependency groups (PEP 735 / uv)
 # ---------------------------------------------------------------------------
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
