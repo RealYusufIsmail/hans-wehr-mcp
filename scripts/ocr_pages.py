@@ -59,7 +59,7 @@ def _require_macos() -> None:
 
 
 def _import_vision():
-    """Lazy import of pyobjc Vision framework with a helpful install hint."""
+    """Lazy import of pyobjc Vision with a helpful install hint."""
     try:
         import Vision
         from Foundation import NSURL
@@ -80,11 +80,15 @@ def _import_vision():
 # 200 DPI is a good balance for dictionary-quality Arabic text.
 OCR_RENDER_DPI = 200
 
-# Vision coordinate system has (0,0) at bottom-left; PyMuPDF uses top-left.
-# All y-coordinates are flipped when converting.
+# Hans Wehr has a two-column layout: Arabic (right) and English (left).
+# This is the normalised x-coordinate of the centre gutter in Vision coordinates
+# (bottom-left origin, 0.0–1.0).  Pages are ~595 pt wide; Arabic column starts
+# around x=330 pt ≈ 0.55 normalised.  We process each column separately so
+# Vision never has to handle mixed RTL Arabic + LTR English in the same region.
+COLUMN_SPLIT_X = 0.52
 
 # Two observations are considered the same "line" if their y-centres are
-# within this many normalised units of each other (~5pt on an A5 page).
+# within this many normalised units of each other (~5 pt on an A5 page).
 LINE_MERGE_THRESHOLD = 0.012
 
 # Gap larger than this between lines → start a new block.
@@ -96,53 +100,59 @@ def _flip_y(y_norm: float) -> float:
     return 1.0 - y_norm
 
 
-def ocr_page(page: fitz.Page, page_number: int) -> dict:
-    """OCR one PDF page using the macOS Vision framework.
+def _is_arabic_text(text: str) -> bool:
+    """Return True if >30 % of the letter characters are Arabic script.
 
-    Renders the page to PNG at OCR_RENDER_DPI, passes it to
-    VNRecognizeTextRequest with Arabic language, converts the resulting
-    VNRecognizedTextObservation list into the same JSON structure that
-    extract.py produces.
+    Used to tag spans produced by the English-column pass that happen to
+    contain inline Arabic examples, so the parser can handle them correctly.
     """
-    Vision, NSURL = _import_vision()
+    arabic_chars = sum(1 for c in text if "\u0600" <= c <= "\u06FF")
+    letter_chars = sum(1 for c in text if c.isalpha())
+    return letter_chars > 0 and (arabic_chars / letter_chars) > 0.30
 
-    # 1. Render page to PNG bytes via PyMuPDF
-    scale = OCR_RENDER_DPI / 72.0
-    mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-    png_bytes = pix.tobytes("png")
 
-    page_width_pt = page.rect.width
-    page_height_pt = page.rect.height
+def _ocr_column_png(
+    Vision,
+    NSURL,
+    png_bytes: bytes,
+    languages: list[str],
+    column_tag: str,
+    x_offset_pt: float,
+    clip_width_pt: float,
+    page_height_pt: float,
+    page_number: int,
+) -> list[dict]:
+    """Run Vision OCR on a pre-clipped column image.
 
-    # 2. Write PNG to a temp file (most reliable way to pass to Vision)
+    Because the PNG contains only one column, Vision never creates observations
+    that span both columns — the RTL/LTR collision is physically impossible.
+
+    Bounding boxes from Vision are normalised to the CLIP image (0–1 relative
+    to clip width/height).  We convert them back to full page coordinates using
+    x_offset_pt and clip_width_pt.
+    """
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
     try:
         os.write(tmp_fd, png_bytes)
         os.close(tmp_fd)
 
-        # 3. Build and run Vision request
         url = NSURL.fileURLWithPath_(tmp_path)
         request = Vision.VNRecognizeTextRequest.alloc().init()
-        request.setRecognitionLanguages_(["ar-SA", "ar"])
-        request.setRecognitionLevel_(
-            Vision.VNRequestTextRecognitionLevelAccurate
-        )
+        request.setRecognitionLanguages_(languages)
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
         request.setUsesLanguageCorrection_(True)
 
         handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(url, {})
         success, error = handler.performRequests_error_([request], None)
 
         if not success or error:
-            log.warning("Page %d: Vision OCR failed — %s", page_number, error)
-            return _empty_page(page_number, page_width_pt, page_height_pt)
+            log.warning("Page %d [%s]: Vision failed — %s", page_number, column_tag, error)
+            return []
 
         observations = request.results() or []
-
     finally:
         os.unlink(tmp_path)
 
-    # 4. Convert VNRecognizedTextObservation list → our span/line/block format
     raw_spans = []
     for obs in observations:
         candidates = obs.topCandidates_(1)
@@ -153,50 +163,113 @@ def ocr_page(page: fitz.Page, page_number: int) -> dict:
             continue
         ocr_conf = float(candidates[0].confidence())
 
-        # Vision bbox: normalised, bottom-left origin, y increases upward
+        # Vision bbox: normalised to the CLIP image, bottom-left origin.
         bbox = obs.boundingBox()
-        x0_n = float(bbox.origin.x)
-        y0_n = _flip_y(float(bbox.origin.y) + float(bbox.size.height))  # top in page coords
-        x1_n = float(bbox.origin.x) + float(bbox.size.width)
-        y1_n = _flip_y(float(bbox.origin.y))                             # bottom in page coords
+        x0_clip = float(bbox.origin.x)
+        x1_clip = x0_clip + float(bbox.size.width)
+        # Flip y from bottom-left to top-left
+        y0_n = _flip_y(float(bbox.origin.y) + float(bbox.size.height))
+        y1_n = _flip_y(float(bbox.origin.y))
 
-        # Convert normalised → page points
-        x0 = round(x0_n * page_width_pt, 2)
+        # Map clip-space x back to full page points:
+        #   page_x = x_offset_pt + x_clip_normalised * clip_width_pt
+        x0 = round(x_offset_pt + x0_clip * clip_width_pt, 2)
+        x1 = round(x_offset_pt + x1_clip * clip_width_pt, 2)
         y0 = round(y0_n * page_height_pt, 2)
-        x1 = round(x1_n * page_width_pt, 2)
         y1 = round(y1_n * page_height_pt, 2)
 
-        # Estimate font size from line height (Vision cap-height ≈ 65% of line box)
         line_height_pt = (y1_n - y0_n) * page_height_pt
         estimated_size = round(line_height_pt * 0.65, 2)
 
+        # is_arabic is content-based (Unicode), column is position-based (clip).
+        is_arabic = _is_arabic_text(text)
+
         raw_spans.append({
-            "text": text,
-            "y0_n": y0_n,  # normalised, for grouping
             "y_centre_n": (y0_n + y1_n) / 2,
             "span": {
                 "text": text,
                 "font": "vision-ocr",
                 "size": max(estimated_size, 1.0),
                 "flags": 0,
-                "is_bold": False,   # Vision doesn't report weight
+                "is_bold": False,   # Vision does not report font weight
                 "is_italic": False,
+                "is_arabic": is_arabic,
+                "column": column_tag,
                 "color": 0,
                 "bbox": [x0, y0, x1, y1],
                 "ocr_confidence": round(ocr_conf, 4),
             },
         })
 
-    # 5. Group spans into lines (close y-centres), lines into blocks (y-gaps)
-    raw_spans.sort(key=lambda s: s["y_centre_n"])
-    blocks = _group_into_blocks(raw_spans)
+    return raw_spans
+
+
+def ocr_page(page: fitz.Page, page_number: int) -> dict:
+    """OCR one PDF page using the macOS Vision framework.
+
+    Hans Wehr has a two-column layout (Arabic right, English left).
+    Running a single Vision request on the full page causes RTL Arabic and
+    LTR English to collide inside the same text observations.
+
+    Fix: render each column as a SEPARATE PNG via PyMuPDF's clip parameter,
+    then run Vision independently on each.  Vision can only see one script
+    direction at a time so observations are always clean.
+
+    Coordinate conversion:
+      - Arabic (right) column clip: x ∈ [split_pt, page_width_pt]
+        → Vision x_normalised maps back via:  page_x = split_pt + x_n * clip_w
+      - English (left) column clip: x ∈ [0, split_pt]
+        → Vision x_normalised maps back via:  page_x = x_n * split_pt
+    """
+    Vision, NSURL = _import_vision()
+
+    scale = OCR_RENDER_DPI / 72.0
+    mat = fitz.Matrix(scale, scale)
+
+    page_width_pt = page.rect.width
+    page_height_pt = page.rect.height
+    split_pt = page_width_pt * COLUMN_SPLIT_X
+
+    # Render each column to its own PNG — physically prevents cross-column bleed
+    clip_arabic = fitz.Rect(split_pt, 0, page_width_pt, page_height_pt)
+    clip_english = fitz.Rect(0, 0, split_pt, page_height_pt)
+
+    png_arabic = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, clip=clip_arabic).tobytes("png")
+    png_english = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, clip=clip_english).tobytes("png")
+
+    common = dict(Vision=Vision, NSURL=NSURL, page_height_pt=page_height_pt, page_number=page_number)
+
+    arabic_spans = _ocr_column_png(
+        **common,
+        png_bytes=png_arabic,
+        languages=["ar-SA", "ar"],
+        column_tag="arabic",
+        x_offset_pt=split_pt,
+        clip_width_pt=page_width_pt - split_pt,
+    )
+    english_spans = _ocr_column_png(
+        **common,
+        png_bytes=png_english,
+        languages=["en-US"],
+        column_tag="english",
+        x_offset_pt=0.0,
+        clip_width_pt=split_pt,
+    )
+
+    if not arabic_spans and not english_spans:
+        log.warning("Page %d: Vision returned no text from either column", page_number)
+        return _empty_page(page_number, page_width_pt, page_height_pt)
+
+    # Merge and sort by y-position (top → bottom reading order)
+    all_spans = arabic_spans + english_spans
+    all_spans.sort(key=lambda s: s["y_centre_n"])
 
     return {
         "page_number": page_number,
         "width": round(page_width_pt, 2),
         "height": round(page_height_pt, 2),
         "source": "vision_ocr",
-        "blocks": blocks,
+        "blocks": _group_into_blocks(all_spans),
     }
 
 
