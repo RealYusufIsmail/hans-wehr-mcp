@@ -322,6 +322,7 @@ Try asking Claude: *"Look up the Arabic root كتب in Hans Wehr"*.
 | `lookup_root(root)` | All entries under a root. Accepts Arabic script or transliteration. |
 | `search_arabic(query, limit?)` | FTS search across Arabic words. Strips diacritics before searching. |
 | `search_english(query, limit?)` | FTS search across English definitions (Porter-stemmed). |
+| `search_transliteration(query, limit?)` | Search by Latin transliteration (e.g. `kataba`, `husn`). Use when the user types in English/Latin letters. |
 | `get_entry(entry_id)` | Full detail for one entry including cross-references and parse metadata. |
 | `list_roots(letter)` | All roots beginning with a given letter. |
 

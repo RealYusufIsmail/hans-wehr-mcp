@@ -242,7 +242,9 @@ def ocr_page(page: fitz.Page, page_number: int) -> dict:
     arabic_spans = _ocr_column_png(
         **common,
         png_bytes=png_arabic,
-        languages=["ar-SA", "ar"],
+        # Arabic primary but include English so Vision can read the Latin
+        # transliterations that follow every Arabic headword on the same line.
+        languages=["ar-SA", "ar", "en-US"],
         column_tag="arabic",
         x_offset_pt=split_pt,
         clip_width_pt=page_width_pt - split_pt,

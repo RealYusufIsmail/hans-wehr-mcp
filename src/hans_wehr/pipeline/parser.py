@@ -58,9 +58,24 @@ log = logging.getLogger(__name__)
 # Font detection thresholds
 # Adjust these after inspecting a sample of extracted pages.
 # ---------------------------------------------------------------------------
+
+# ── Selectable-PDF path (PyMuPDF / hans-extract) ──────────────────────────
+# Font metadata (bold flag + size) is available.
 ROOT_FONT_SIZE_MIN = 10.5    # pt — root headwords are in a larger font
 DERIVED_FONT_SIZE_MIN = 8.5  # pt — derived forms in medium bold
 SMALL_FONT_SIZE_MAX = 8.4    # pt — superscripts, footnotes (skip)
+
+# ── Vision OCR path (hans-ocr / scanned PDF) ──────────────────────────────
+# Vision doesn't report bold/italic.  We detect headwords by:
+#   1. span.column == "arabic"  (right column of the page)
+#   2. span contains any Arabic script character
+#   3. estimated font size from bounding-box height
+#
+# Hans Wehr root headwords are ~11–13 pt; derived forms ~9–11 pt.
+# Vision's size estimate (bbox_height × 0.65) tends to run small, so the
+# thresholds here are lower than for selectable PDFs.
+VISION_ROOT_SIZE_MIN = 9.0     # pt — root headwords in Vision output
+VISION_DERIVED_SIZE_MIN = 7.5  # pt — derived forms in Vision output
 
 # ---------------------------------------------------------------------------
 # Arabic diacritics stripping
@@ -78,11 +93,48 @@ def strip_diacritics(text: str) -> str:
 # same span or the next non-Arabic span, in a Latin script.
 # ---------------------------------------------------------------------------
 _ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+# Matches a run of Arabic characters (including spaces between them)
+_ARABIC_RUN_RE = re.compile(r"[\u0600-\u06FF][\u0600-\u06FF\s]*[\u0600-\u06FF]|[\u0600-\u06FF]")
+# Latin letters including composed characters used in Hans Wehr transliteration
+_LATIN_WORD_RE = re.compile(r"[a-zA-Z\u00C0-\u024F\u02BC\u02BE][\w\u00C0-\u024F\u02BC\u02BE\-']*")
 
 
 def is_arabic_text(text: str) -> bool:
     """True if the text contains Arabic characters."""
     return bool(_ARABIC_RE.search(text))
+
+
+def contains_arabic(text: str) -> bool:
+    """True if *any* Arabic character is present (lower threshold than is_arabic_text)."""
+    return bool(_ARABIC_RE.search(text))
+
+
+def extract_arabic_portion(text: str) -> str:
+    """Return only the Arabic-script characters (and spaces between them) from text.
+
+    Used with Vision OCR spans that contain mixed Arabic headword + Latin
+    transliteration on the same line, e.g.:
+        "بغضاء bigda and بغضة ,bugd بغض"  →  "بغضاء بغضة بغض"
+    """
+    runs = _ARABIC_RUN_RE.findall(text)
+    return " ".join(r.strip() for r in runs if r.strip())
+
+
+def extract_transliteration_from_span(text: str) -> str:
+    """Extract the first Latin word (transliteration) from a mixed Vision span.
+
+    Hans Wehr right-column lines look like:
+        "[Arabic] translit optional-short-definition"
+    The transliteration is the first Latin word (may include diacritics like ā, ḥ).
+    """
+    m = _LATIN_WORD_RE.search(text)
+    if not m:
+        return ""
+    # Take everything up to the first comma / semicolon / opening paren
+    candidate = re.split(r"[,;(]", text[m.start():])[0].strip()
+    # Strip trailing punctuation and limit to ~30 chars (transliterations are short)
+    candidate = candidate.rstrip(" .,:;")
+    return candidate if len(candidate) <= 30 else ""
 
 
 def is_latin_text(text: str) -> bool:
@@ -139,6 +191,15 @@ class RawSpan:
     is_italic: bool
     font: str
     bbox: list[float]
+    # Present only in Vision OCR pages (source == "vision_ocr")
+    column: str = ""          # "arabic" | "english" | ""
+    is_arabic: bool = False   # content-based: >30% Arabic chars
+    ocr_confidence: float = 1.0
+
+    @property
+    def is_vision(self) -> bool:
+        """True when this span was produced by Vision OCR (not PyMuPDF)."""
+        return self.font == "vision-ocr"
 
 
 @dataclass
@@ -229,17 +290,43 @@ def _collect_spans(page_data: dict) -> list[RawSpan]:
                         is_italic=span.get("is_italic", False),
                         font=span.get("font", ""),
                         bbox=span.get("bbox", [0, 0, 0, 0]),
+                        column=span.get("column", ""),
+                        is_arabic=span.get("is_arabic", False),
+                        ocr_confidence=span.get("ocr_confidence", 1.0),
                     ))
     return spans
 
 
 def _is_root_span(span: RawSpan) -> bool:
-    """Heuristic: root headword spans are bold AND above the root size threshold."""
+    """Heuristic: is this span an Arabic root headword?
+
+    Selectable-PDF path: requires bold flag + large size.
+    Vision OCR path: uses column position + any Arabic content + size.
+      Root headwords appear in the RIGHT column and are the largest Arabic
+      text on the line.  The font size estimate from Vision is the bbox height
+      × 0.65, which runs smaller than the true pt size, so the threshold is
+      lower than for selectable PDFs.
+    """
+    if span.is_vision:
+        return (
+            span.column == "arabic"
+            and contains_arabic(span.text)
+            and span.size >= VISION_ROOT_SIZE_MIN
+        )
     return span.is_bold and span.size >= ROOT_FONT_SIZE_MIN and is_arabic_text(span.text)
 
 
 def _is_derived_span(span: RawSpan) -> bool:
-    """Heuristic: derived form spans are bold but smaller than root headwords."""
+    """Heuristic: is this span a derived Arabic form (sub-entry under a root)?
+
+    Same two-path logic as _is_root_span.
+    """
+    if span.is_vision:
+        return (
+            span.column == "arabic"
+            and contains_arabic(span.text)
+            and VISION_DERIVED_SIZE_MIN <= span.size < VISION_ROOT_SIZE_MIN
+        )
     return (
         span.is_bold
         and DERIVED_FONT_SIZE_MIN <= span.size < ROOT_FONT_SIZE_MIN
@@ -387,6 +474,15 @@ def parse_page(page_data: dict) -> Iterator[dict]:
 
         # Score
         result["confidence"] = compute_confidence(entry)
+
+        # Vision OCR pages lack bold detection and produce mixed-content spans.
+        # Cap confidence so every Vision entry goes through LLM refinement.
+        if any(s.is_vision for s in current_entry_spans):
+            result["confidence"] = min(result["confidence"], 0.60)
+            if "vision_ocr_source" not in result.get("warnings", []):
+                result.setdefault("warnings", []).append("vision_ocr_source")
+            result["parse_method"] = "vision_ocr"
+
         result["needs_review"] = result["confidence"] < 0.75
 
         # Reset accumulators
@@ -397,23 +493,32 @@ def parse_page(page_data: dict) -> Iterator[dict]:
 
         return result
 
+    is_vision_page = page_data.get("source") == "vision_ocr"
+
     for span in spans:
         if _is_root_span(span):
-            # Flush any pending entry before starting new root
             e = _flush_entry()
             if e:
                 yield e
 
-            # Also emit a stub for the root itself (root = first entry under it)
-            arabic = span.text.strip()
+            # For Vision OCR: the span contains "[Arabic headword] [transliteration] [definition]"
+            # all mixed together.  Split out the Arabic and Latin parts.
+            if span.is_vision:
+                arabic = extract_arabic_portion(span.text) or span.text.strip()
+                translit = extract_transliteration_from_span(span.text)
+            else:
+                arabic = span.text.strip()
+                translit = ""
+
             current_root = {
                 "arabic": arabic,
                 "arabic_unvoweled": strip_diacritics(arabic),
-                "transliteration": "",    # filled from the next Latin span
+                "transliteration": translit,
                 "page_number": page_number,
             }
             current_entry_arabic = arabic
             current_entry_arabic_unvoweled = strip_diacritics(arabic)
+            current_entry_translit = translit
             current_entry_spans = [span]
 
         elif _is_derived_span(span):
@@ -421,32 +526,34 @@ def parse_page(page_data: dict) -> Iterator[dict]:
             if e:
                 yield e
 
-            arabic = span.text.strip()
+            if span.is_vision:
+                arabic = extract_arabic_portion(span.text) or span.text.strip()
+                current_entry_translit = extract_transliteration_from_span(span.text)
+            else:
+                arabic = span.text.strip()
+                current_entry_translit = ""
+
             current_entry_arabic = arabic
             current_entry_arabic_unvoweled = strip_diacritics(arabic)
             current_entry_spans = [span]
 
         else:
-            # Accumulate into current entry
             if current_root is None:
-                # Haven't seen any root yet on this page; skip
                 continue
 
             current_entry_spans.append(span)
 
-            # Opportunistically capture transliteration from the first Latin span
-            # that follows an Arabic headword
+            # Capture transliteration from the first Latin span after a headword.
+            # For Vision OCR this was already extracted from the mixed span above;
+            # for selectable PDFs we look at subsequent non-bold Latin spans.
             if (not current_entry_translit and is_latin_text(span.text)
                     and not span.is_bold and current_entry_arabic):
-                # Take up to the first comma/semicolon/newline as transliteration
                 candidate = re.split(r"[,;(]", span.text)[0].strip()
                 if candidate and not is_arabic_text(candidate):
                     current_entry_translit = candidate
-                    # Also propagate to root if we're on the first root span
                     if current_root and not current_root["transliteration"]:
                         current_root["transliteration"] = candidate
 
-    # Flush the last pending entry on the page
     e = _flush_entry()
     if e:
         yield e
