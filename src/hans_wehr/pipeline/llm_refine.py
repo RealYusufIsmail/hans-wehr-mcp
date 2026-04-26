@@ -1,8 +1,17 @@
 """
 src/pipeline/llm_refine.py
 --------------------------
-Stage 3 (optional): send low-confidence parsed entries to the Anthropic API
-and ask it to return corrected structured JSON.
+Stage 3 (optional): send low-confidence parsed entries to an LLM and ask it
+to return corrected structured JSON.
+
+Two backends are supported:
+
+  --local   Use a locally-running Ollama server (default model: qwen2.5:7b).
+            Free, on-device, no API key required.  Recommended for Apple Silicon.
+            Install: brew install ollama && ollama pull qwen2.5:7b
+
+  (default) Use the Anthropic API (claude-sonnet-4-20250514).
+            Requires ANTHROPIC_API_KEY in the environment.
 
 This stage is NOT the primary parser — it is a cleanup pass. The structural
 parse output and raw_text are always preserved in parse_metadata so the audit
@@ -11,15 +20,20 @@ trail is never lost.
 Design:
   - Reads data/processed/entries.jsonl
   - Filters entries where needs_review == true
-  - Batches them into API requests (up to BATCH_SIZE entries per call)
-  - Before running, prints a cost estimate and asks for confirmation
+  - Batches them into LLM requests (up to BATCH_SIZE entries per call)
+  - Before running (Anthropic only), prints a cost estimate and asks for confirmation
   - Writes refined entries to data/processed/entries_refined.jsonl
   - Entries that were NOT refined are copied through unchanged
 
 Usage:
-  python -m src.pipeline.llm_refine --input data/processed/entries.jsonl \
-      --out data/processed/entries_refined.jsonl
-  python -m src.pipeline.llm_refine --dry-run  # cost estimate only, no API calls
+  # On-device (free, Apple Silicon recommended):
+  uv run hans-refine --local
+  uv run hans-refine --local --model qwen2.5:14b
+
+  # Cloud (Anthropic):
+  uv run hans-refine
+  uv run hans-refine --dry-run  # cost estimate only, no API calls
+  uv run hans-refine --with-images --pdf data/hans_wehr.pdf
 """
 
 from __future__ import annotations
@@ -29,9 +43,10 @@ import json
 import logging
 import re
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-import anthropic
 import fitz  # PyMuPDF — used for page thumbnail rendering
 import typer
 from dotenv import load_dotenv
@@ -49,8 +64,11 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL = "claude-sonnet-4-20250514"
-BATCH_SIZE = 10           # entries per API call
+ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+
+BATCH_SIZE = 10           # entries per LLM call
 MAX_RETRIES = 5
 INITIAL_RETRY_DELAY = 2.0  # seconds
 
@@ -161,7 +179,7 @@ def _build_user_message(
 ) -> list[dict]:
     """Build the user message content blocks for one API call.
 
-    Returns a list of Anthropic content blocks (text and optionally image).
+    Returns a list of Anthropic content blocks (may include image blocks).
     page_images maps page_number → base64 PNG string.
     """
     text_lines = [
@@ -202,24 +220,42 @@ def _build_user_message(
     return content
 
 
+def _build_text_prompt(batch: list[dict]) -> str:
+    """Build a plain-text prompt for Ollama (no image blocks)."""
+    lines = [
+        "Correct each of the following dictionary entries. Return a JSON array — one object per entry.",
+        f"Each object must match this schema:\n{ENTRY_SCHEMA}",
+        "Entries to correct:\n",
+    ]
+    for i, entry in enumerate(batch):
+        lines.append(f"--- Entry {i + 1} ---")
+        lines.append(f"raw_text: {entry.get('raw_text', '')}")
+        lines.append(f"current_arabic: {entry.get('arabic', '')}")
+        lines.append(f"current_definition: {entry.get('definition', '')}")
+        lines.append(f"warnings: {entry.get('warnings', [])}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
-# API call with retry / rate-limit handling
+# Anthropic API call with retry / rate-limit handling
 # ---------------------------------------------------------------------------
 
-def _call_api_with_retry(
-    client: anthropic.Anthropic,
+def _call_anthropic_with_retry(
+    client,  # anthropic.Anthropic
     user_content: list[dict],
 ) -> tuple[str, int, int]:
     """Call the Anthropic API, retrying on rate-limit errors.
 
-    user_content is a list of Anthropic content blocks (may include image blocks).
     Returns (response_text, input_tokens, output_tokens).
     """
+    import anthropic as _anthropic
+
     delay = INITIAL_RETRY_DELAY
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = client.messages.create(
-                model=MODEL,
+                model=ANTHROPIC_MODEL,
                 max_tokens=4096,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_content}],
@@ -228,14 +264,14 @@ def _call_api_with_retry(
             usage = response.usage
             return text, usage.input_tokens, usage.output_tokens
 
-        except anthropic.RateLimitError:
+        except _anthropic.RateLimitError:
             if attempt == MAX_RETRIES:
                 raise
             log.warning("Rate limit hit, retrying in %.1f s (attempt %d/%d)", delay, attempt, MAX_RETRIES)
             time.sleep(delay)
             delay = min(delay * 2, 60.0)
 
-        except anthropic.APIStatusError as exc:
+        except _anthropic.APIStatusError as exc:
             if attempt == MAX_RETRIES or exc.status_code < 500:
                 raise
             log.warning("API error %d, retrying in %.1f s", exc.status_code, delay)
@@ -245,7 +281,85 @@ def _call_api_with_retry(
     raise RuntimeError("Exhausted retries")  # unreachable, but satisfies type checker
 
 
-def _parse_llm_response(raw_response: str, batch: list[dict]) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Ollama API call (stdlib urllib — no extra dependencies)
+# ---------------------------------------------------------------------------
+
+def _call_ollama(
+    prompt: str,
+    model: str,
+    ollama_url: str,
+) -> str:
+    """Send a chat request to a local Ollama server.
+
+    Uses only stdlib urllib so no extra dependency is needed.
+    Returns the assistant message text.
+    Raises urllib.error.URLError if Ollama is not reachable.
+    """
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.1,  # low temperature for structured output
+        },
+    }).encode("utf-8")
+
+    url = ollama_url.rstrip("/") + "/api/chat"
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            return body["message"]["content"]
+    except urllib.error.URLError as exc:
+        raise urllib.error.URLError(
+            f"Cannot reach Ollama at {url}. "
+            f"Is it running? Start with: ollama serve\n"
+            f"Original error: {exc.reason}"
+        ) from exc
+
+
+def _check_ollama_reachable(ollama_url: str, model: str) -> None:
+    """Verify Ollama is running and the requested model is available."""
+    tags_url = ollama_url.rstrip("/") + "/api/tags"
+    try:
+        with urllib.request.urlopen(tags_url, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        console.print(
+            f"[bold red]Error:[/bold red] Cannot reach Ollama at {ollama_url}.\n"
+            "Start it with:  [bold]ollama serve[/bold]\n"
+            f"Details: {exc}"
+        )
+        raise typer.Exit(2)
+
+    available = [m["name"] for m in data.get("models", [])]
+    # Check for exact or prefix match (e.g. "qwen2.5:7b" matches "qwen2.5:7b-instruct-q4_K_M")
+    if not any(m.startswith(model.split(":")[0]) for m in available):
+        console.print(
+            f"[bold red]Error:[/bold red] Model [cyan]{model}[/cyan] not found in Ollama.\n"
+            f"Available models: {', '.join(available) or '(none)'}\n"
+            f"Pull it with:  [bold]ollama pull {model}[/bold]"
+        )
+        raise typer.Exit(2)
+
+    console.print(f"[green]Ollama reachable.[/green] Using model [cyan]{model}[/cyan].")
+
+
+# ---------------------------------------------------------------------------
+# Response parsing (shared between both backends)
+# ---------------------------------------------------------------------------
+
+def _parse_llm_response(raw_response: str, batch: list[dict], parse_method: str) -> list[dict]:
     """Parse the JSON array from the LLM response.
 
     If parsing fails, return the original entries unchanged with a warning added.
@@ -272,10 +386,9 @@ def _parse_llm_response(raw_response: str, batch: list[dict]) -> list[dict]:
         if i < len(corrections):
             correction = corrections[i]
             if isinstance(correction, dict):
-                # Merge: LLM fields overwrite structural parse, but preserve audit fields
                 updated = {**entry, **correction}
-                updated["parse_method"] = "llm_refined"
-                updated["llm_model"] = MODEL
+                updated["parse_method"] = parse_method
+                updated["llm_model"] = parse_method  # record which backend was used
                 # Keep the original raw_text
                 updated["raw_text"] = entry.get("raw_text", "")
                 merged.append(updated)
@@ -289,7 +402,7 @@ def _parse_llm_response(raw_response: str, batch: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Cost estimation
+# Cost estimation (Anthropic only)
 # ---------------------------------------------------------------------------
 
 def estimate_cost(n_entries: int, with_images: bool = False) -> dict:
@@ -358,9 +471,19 @@ def refine_entries(
     dry_run: bool,
     threshold: float,
     limit: int | None,
+    use_local: bool = False,
+    ollama_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_url: str = DEFAULT_OLLAMA_URL,
     with_images: bool = False,
     pdf_path: Path | None = None,
 ) -> None:
+    if with_images and use_local:
+        console.print(
+            "[yellow]Note:[/yellow] --with-images is not supported with --local (Ollama). "
+            "Images will be ignored."
+        )
+        with_images = False
+
     if with_images and (pdf_path is None or not pdf_path.exists()):
         console.print(
             "[bold red]Error:[/bold red] --with-images requires --pdf pointing to the source PDF."
@@ -389,28 +512,37 @@ def refine_entries(
 
     console.print(f"{len(to_refine)} entries flagged for refinement, {len(pass_through)} pass-through.")
 
-    cost = estimate_cost(len(to_refine), with_images=with_images)
-    _print_cost_table(cost)
+    if use_local:
+        backend_label = f"Ollama ({ollama_model})"
+        console.print(f"[cyan]Backend:[/cyan] {backend_label} — free, on-device, no cost.")
+    else:
+        cost = estimate_cost(len(to_refine), with_images=with_images)
+        _print_cost_table(cost)
 
     if dry_run:
-        console.print("[yellow]Dry-run mode:[/yellow] no API calls made.")
+        console.print("[yellow]Dry-run mode:[/yellow] no LLM calls made.")
         return
 
     if len(to_refine) == 0:
         console.print("[green]No entries need refinement.[/green]")
-        # Still write the pass-through entries
         _write_output(out_path, pass_through)
         return
 
-    if not typer.confirm(f"Proceed with ~${cost['approx_cost_usd']:.4f} in API costs?"):
-        console.print("Aborted.")
-        raise typer.Exit(0)
+    if use_local:
+        # Verify Ollama is available before starting the long batch run
+        _check_ollama_reachable(ollama_url, ollama_model)
+    else:
+        if not typer.confirm(f"Proceed with ~${cost['approx_cost_usd']:.4f} in API costs?"):
+            console.print("Aborted.")
+            raise typer.Exit(0)
 
-    client = anthropic.Anthropic()
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic()
 
     refined: list[dict] = []
     total_input_tokens = 0
     total_output_tokens = 0
+    parse_method = "llm_refined_local" if use_local else "llm_refined"
 
     batches = [to_refine[i:i + BATCH_SIZE] for i in range(0, len(to_refine), BATCH_SIZE)]
 
@@ -421,53 +553,63 @@ def refine_entries(
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Refining entries", total=len(batches))
+        task_label = f"Refining via {ollama_model}" if use_local else "Refining entries"
+        task = progress.add_task(task_label, total=len(batches))
 
         for batch in batches:
-            # Render page thumbnails for this batch (de-duplicated by page number)
-            page_images: dict[int, str] | None = None
-            if with_images and pdf_path:
-                page_images = {}
-                for entry in batch:
-                    page_num = entry.get("page_number")
-                    if page_num and page_num not in page_images:
-                        thumbnail = _render_page_thumbnail(pdf_path, page_num)
-                        if thumbnail:
-                            page_images[page_num] = thumbnail
-
-                # Estimate image token cost for this specific batch and log it
-                batch_image_tokens = len(page_images) * APPROX_IMAGE_TOKENS_PER_PAGE
-                log.debug(
-                    "Batch: %d entries, %d unique page images (~%d image tokens)",
-                    len(batch), len(page_images), batch_image_tokens,
-                )
-
-            user_content = _build_user_message(batch, page_images)
             try:
-                response_text, in_tok, out_tok = _call_api_with_retry(client, user_content)
-                total_input_tokens += in_tok
-                total_output_tokens += out_tok
-                corrected_batch = _parse_llm_response(response_text, batch)
-                refined.extend(corrected_batch)
+                if use_local:
+                    prompt = _build_text_prompt(batch)
+                    response_text = _call_ollama(prompt, ollama_model, ollama_url)
+                    corrected_batch = _parse_llm_response(response_text, batch, parse_method)
+                    refined.extend(corrected_batch)
+                else:
+                    # Render page thumbnails for this batch (de-duplicated by page number)
+                    page_images: dict[int, str] | None = None
+                    if with_images and pdf_path:
+                        page_images = {}
+                        for entry in batch:
+                            page_num = entry.get("page_number")
+                            if page_num and page_num not in page_images:
+                                thumbnail = _render_page_thumbnail(pdf_path, page_num)
+                                if thumbnail:
+                                    page_images[page_num] = thumbnail
+
+                        batch_image_tokens = len(page_images) * APPROX_IMAGE_TOKENS_PER_PAGE
+                        log.debug(
+                            "Batch: %d entries, %d unique page images (~%d image tokens)",
+                            len(batch), len(page_images), batch_image_tokens,
+                        )
+
+                    user_content = _build_user_message(batch, page_images)
+                    response_text, in_tok, out_tok = _call_anthropic_with_retry(client, user_content)
+                    total_input_tokens += in_tok
+                    total_output_tokens += out_tok
+                    corrected_batch = _parse_llm_response(response_text, batch, parse_method)
+                    refined.extend(corrected_batch)
+
             except Exception as exc:
                 log.error("Batch failed: %s — keeping originals", exc)
                 for entry in batch:
                     entry.setdefault("warnings", []).append(f"llm_batch_error:{exc}")
                 refined.extend(batch)
+
             progress.advance(task)
 
-    actual_cost = (
-        (total_input_tokens / 1_000_000) * INPUT_COST_PER_MTOK
-        + (total_output_tokens / 1_000_000) * OUTPUT_COST_PER_MTOK
-    )
-    console.print(
-        f"[green]Done.[/green] Used {total_input_tokens:,} input + "
-        f"{total_output_tokens:,} output tokens. "
-        f"Actual cost: ~${actual_cost:.4f}"
-    )
+    if use_local:
+        console.print(f"[green]Done.[/green] {len(refined)} entries refined via {ollama_model}.")
+    else:
+        actual_cost = (
+            (total_input_tokens / 1_000_000) * INPUT_COST_PER_MTOK
+            + (total_output_tokens / 1_000_000) * OUTPUT_COST_PER_MTOK
+        )
+        console.print(
+            f"[green]Done.[/green] Used {total_input_tokens:,} input + "
+            f"{total_output_tokens:,} output tokens. "
+            f"Actual cost: ~${actual_cost:.4f}"
+        )
 
     # Merge refined + pass-through and write output
-    # Preserve original page order by re-sorting on page_number then entry order
     all_output = pass_through + refined
     all_output.sort(key=lambda e: (e.get("page_number", 0), e.get("arabic", "")))
     _write_output(out_path, all_output)
@@ -497,10 +639,29 @@ def main(
         "--out", "-o",
         help="Output JSONL with refined entries merged in.",
     ),
+    local: bool = typer.Option(
+        False,
+        "--local",
+        help=(
+            "Use a local Ollama server instead of the Anthropic API. "
+            "Free, on-device, no API key required. "
+            "Requires Ollama running: brew install ollama && ollama serve"
+        ),
+    ),
+    model: str = typer.Option(
+        DEFAULT_OLLAMA_MODEL,
+        "--model",
+        help=f"Ollama model name (only used with --local). Default: {DEFAULT_OLLAMA_MODEL}",
+    ),
+    ollama_url: str = typer.Option(
+        DEFAULT_OLLAMA_URL,
+        "--ollama-url",
+        help=f"Ollama server URL (only used with --local). Default: {DEFAULT_OLLAMA_URL}",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Print cost estimate and exit without making any API calls.",
+        help="Print cost estimate and exit without making any LLM calls.",
     ),
     threshold: float = typer.Option(
         CONFIDENCE_THRESHOLD,
@@ -518,7 +679,8 @@ def main(
         help=(
             "Attach a page thumbnail (PNG, max 1200px wide) to each API batch. "
             "Gives the model visual context but significantly increases token cost. "
-            "Requires --pdf. Run --dry-run first to see the cost breakdown."
+            "Requires --pdf. Run --dry-run first to see the cost breakdown. "
+            "Not supported with --local."
         ),
     ),
     pdf: Path | None = typer.Option(
@@ -528,13 +690,18 @@ def main(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Send low-confidence entries to Claude for structured correction.
+    """Send low-confidence entries to an LLM for structured correction.
 
-    Always estimates cost before making API calls and asks for confirmation.
+    Two backends:
 
-    Use --with-images to attach page thumbnails for better context on entries
-    with garbled text.  Run --dry-run first to see the full cost breakdown
-    before committing to an expensive image-enabled pass.
+    \b
+    --local   Free, on-device via Ollama (recommended on Apple Silicon).
+              brew install ollama && ollama pull qwen2.5:7b && ollama serve
+
+    \b
+    (default) Anthropic API (claude-sonnet-4-20250514). Requires ANTHROPIC_API_KEY.
+              Estimates cost and asks for confirmation before making calls.
+              Use --with-images for better context on garbled entries.
     """
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -545,7 +712,14 @@ def main(
         console.print(f"[bold red]Error:[/bold red] Input file not found: {input}")
         raise typer.Exit(2)
 
-    refine_entries(input, out, dry_run, threshold, limit, with_images=with_images, pdf_path=pdf)
+    refine_entries(
+        input, out, dry_run, threshold, limit,
+        use_local=local,
+        ollama_model=model,
+        ollama_url=ollama_url,
+        with_images=with_images,
+        pdf_path=pdf,
+    )
 
 
 if __name__ == "__main__":

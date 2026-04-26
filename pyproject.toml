@@ -10,23 +10,44 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
-    # MCP server framework
+    # MCP server — the only true runtime dependency
     "mcp>=1.0.0",
-    # PDF extraction with full font metadata
-    "PyMuPDF>=1.24.0",
-    # Anthropic API for LLM refinement pass
-    "anthropic>=0.40.0",
-    # SQLite ORM / query helpers
-    "sqlite-utils>=3.37",
-    # Terminal output formatting
-    "rich>=13.0.0",
-    # CLI command framework
-    "typer>=0.12.0",
-    # Environment variable loading
     "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
+# ── Cloud pipeline ────────────────────────────────────────────────────────────
+# Full pipeline using the Anthropic API for LLM refinement.
+# Install with:  uv pip install hans-wehr-mcp[pipeline]
+pipeline = [
+    "PyMuPDF>=1.24.0",
+    "anthropic>=0.40.0",
+    "sqlite-utils>=3.37",
+    "rich>=13.0.0",
+    "typer>=0.12.0",
+    # OCR verification layer — cross-checks Vision/Tesseract output
+    # Also requires: brew install tesseract tesseract-lang  (macOS)
+    #                apt install tesseract-ocr tesseract-ocr-ara (Ubuntu)
+    "ocrmypdf>=16.0.0",
+]
+# ── On-device pipeline (macOS Apple Silicon, zero API cost) ───────────────────
+# Uses macOS Vision framework for OCR + Ollama for LLM refinement.
+# Requires: brew install ollama && ollama pull qwen2.5:7b
+#           brew install tesseract tesseract-lang   (for verify_ocr.py)
+# Install with:  uv pip install hans-wehr-mcp[pipeline-local]
+pipeline-local = [
+    "PyMuPDF>=1.24.0",
+    "sqlite-utils>=3.37",
+    "rich>=13.0.0",
+    "typer>=0.12.0",
+    # macOS Vision + Quartz for on-device OCR (scanned PDF path only)
+    "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    # OCR verification layer — cross-checks Vision/Tesseract output
+    # Also requires: brew install tesseract tesseract-lang
+    "ocrmypdf>=16.0.0",
+]
+# ── Dev ───────────────────────────────────────────────────────────────────────
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -40,6 +61,8 @@ dev = [
 hans-probe    = "scripts.probe_pdf:app"
 # Main pipeline commands (steps 1–4)
 hans-extract  = "hans_wehr.pipeline.extract:app"
+hans-ocr      = "scripts.ocr_pages:app"
+hans-verify-ocr = "scripts.verify_ocr:app"
 hans-parse    = "hans_wehr.pipeline.parser:app"
 hans-refine   = "hans_wehr.pipeline.llm_refine:app"
 hans-import   = "scripts.import_db:app"
