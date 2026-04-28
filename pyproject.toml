@@ -25,6 +25,8 @@ pipeline = [
     "sqlite-utils>=3.37",
     "rich>=13.0.0",
     "typer>=0.12.0",
+    # Language detection for RTF parser (hans-ocr-rtf)
+    "langdetect>=1.0.9",
     # OCR verification layer — cross-checks Vision/Tesseract output
     # Also requires: brew install tesseract tesseract-lang  (macOS)
     #                apt install tesseract-ocr tesseract-ocr-ara (Ubuntu)
@@ -40,6 +42,8 @@ pipeline-local = [
     "sqlite-utils>=3.37",
     "rich>=13.0.0",
     "typer>=0.12.0",
+    # Language detection for RTF parser (hans-ocr-rtf)
+    "langdetect>=1.0.9",
     # macOS Vision + Quartz for on-device OCR (scanned PDF path only)
     "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
@@ -62,6 +66,7 @@ hans-probe    = "scripts.probe_pdf:app"
 # Main pipeline commands (steps 1–4)
 hans-extract  = "hans_wehr.pipeline.extract:app"
 hans-ocr      = "scripts.ocr_pages:app"
+hans-ocr-rtf  = "scripts.parse_rtf:app"
 hans-verify-ocr = "scripts.verify_ocr:app"
 hans-parse    = "hans_wehr.pipeline.parser:app"
 hans-refine   = "hans_wehr.pipeline.llm_refine:app"

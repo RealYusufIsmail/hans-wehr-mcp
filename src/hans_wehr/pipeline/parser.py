@@ -147,30 +147,42 @@ def is_latin_text(text: str) -> bool:
 
 # ---------------------------------------------------------------------------
 # Part-of-speech detection
-# Hans Wehr uses abbreviated POS tags in italic, e.g.:
-#   n., v., adj., adv., prep., conj., interj., pron.
+# Hans Wehr uses abbreviated POS tags in italic.  Longer abbreviations must
+# appear before shorter ones in the alternation so the regex matches greedily.
 # ---------------------------------------------------------------------------
 _POS_MAP: dict[str, str] = {
-    "n.": "noun",
-    "vn.": "noun",       # verbal noun
-    "v.": "verb",
-    "adj.": "adjective",
-    "adv.": "adverb",
+    "prop.n.": "proper_noun",
+    "n.un.": "nomen_unitatis",
+    "interj.": "particle",
     "prep.": "particle",
     "conj.": "particle",
-    "interj.": "particle",
     "pron.": "particle",
+    "adj.": "adjective",
+    "adv.": "adverb",
+    "coll.": "collective_noun",
     "num.": "noun",
-    "prop.n.": "proper_noun",
+    "vn.": "verbal_noun",
+    "ap.": "active_participle",
+    "pp.": "passive_participle",
+    "el.": "elative",
+    "n.": "noun",
+    "v.": "verb",
 }
 
+# Use negative-lookbehind/lookahead instead of \b because abbreviations end
+# with "." which is a non-word char, so \b never matches after them.
 _POS_RE = re.compile(
-    r"\b(" + "|".join(re.escape(k) for k in _POS_MAP) + r")\b",
+    r"(?<!\w)("
+    + "|".join(re.escape(k) for k in sorted(_POS_MAP, key=len, reverse=True))
+    + r")(?!\w)",
     re.IGNORECASE,
 )
 
 # Verb form pattern — Roman numerals I–X possibly with subforms (e.g. "II.", "IV")
 _VERB_FORM_RE = re.compile(r"\b(X{0,1}(?:IX|IV|V?I{0,3}))\.?\b")
+
+# Verb form section header: bold Roman numeral II–X at the start of a span.
+_VERB_FORM_SECTION_RE = re.compile(r"^\s*(X{0,1}(?:IX|IV|V?I{0,3}))[\.\s]", re.IGNORECASE)
 
 # Plural bracket pattern — e.g. "(pl. كُتُب)" or "(~ات)"
 _PLURAL_RE = re.compile(r"\(pl\.\s*(.*?)\)", re.UNICODE)
@@ -221,6 +233,10 @@ class ParsedEntry:
     needs_review: bool
     raw_text: str
     warnings: list[str] = field(default_factory=list)
+    # Dictionary-structure fields
+    entry_type: str | None = None           # root_verb | verb_form | verbal_noun | …
+    parent_verb_form: str | None = None     # Roman numeral section this entry lives under
+    definitions: list[str] = field(default_factory=list)  # definition split on semicolons
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -254,6 +270,13 @@ def compute_confidence(entry: ParsedEntry) -> float:
     if not entry.definition or len(entry.definition.strip()) < 3:
         score -= 0.20
         entry.warnings.append("empty_definition")
+
+    # Combined penalty: both arabic and definition missing = completely unparsed
+    if (not entry.arabic or not is_arabic_text(entry.arabic)) and (
+        not entry.definition or len(entry.definition.strip()) < 3
+    ):
+        score -= 0.40
+        entry.warnings.append("completely_unparsed")
 
     # Check for garbled Unicode (replacement characters)
     if "\uFFFD" in entry.raw_text:
@@ -365,6 +388,83 @@ def _roman_to_int(s: str) -> int:
     return result
 
 
+def _is_verb_form_header(span: RawSpan) -> bool:
+    """True if this bold Latin span is a Roman numeral verb form section header (II–X)."""
+    if not span.is_bold or is_arabic_text(span.text):
+        return False
+    m = _VERB_FORM_SECTION_RE.match(span.text)
+    if not m:
+        return False
+    try:
+        val = _roman_to_int(m.group(1).upper())
+        return 2 <= val <= 10
+    except ValueError:
+        return False
+
+
+def expand_tilde(text: str, headword_unvoweled: str) -> str:
+    """Replace every ~ with the current entry's unvoweled headword.
+
+    Hans Wehr uses ~ as shorthand for the entry's root word in definitions
+    and plural patterns (e.g. "~ات" = root + plural suffix ات).
+    """
+    if "~" not in text:
+        return text
+    return text.replace("~", headword_unvoweled)
+
+
+def split_definitions(text: str) -> list[str]:
+    """Split a definition string on semicolons, skipping those inside parentheses.
+
+    Returns a list of stripped, non-empty definition fragments.
+    """
+    parts: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == ";" and depth == 0:
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+        else:
+            buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _infer_entry_type(
+    pos: str | None,
+    verb_form: str | None,
+    parent_verb_form: str | None,
+) -> str | None:
+    """Map POS + verb form context to a semantic entry type label."""
+    if pos == "verb":
+        return "verb_form" if (verb_form and verb_form != "I") else "root_verb"
+    _type_map: dict[str, str] = {
+        "verbal_noun": "verbal_noun",
+        "active_participle": "active_participle",
+        "passive_participle": "passive_participle",
+        "collective_noun": "collective_noun",
+        "nomen_unitatis": "nomen_unitatis",
+        "elative": "elative",
+        "noun": "derived_noun",
+        "proper_noun": "derived_noun",
+        "adjective": "derived_adjective",
+        "adverb": "derived_other",
+        "particle": "derived_other",
+    }
+    return _type_map.get(pos or "")
+
+
 def _extract_plurals(text: str) -> list[str]:
     """Extract plural forms from "(pl. X, Y)" patterns."""
     plurals: list[str] = []
@@ -426,6 +526,7 @@ def parse_page(page_data: dict) -> Iterator[dict]:
     current_entry_arabic_unvoweled: str = ""
     current_entry_translit: str = ""
     current_entry_spans: list[RawSpan] = []
+    current_verb_form_section: str | None = None  # tracks II–X section headers
 
     def _flush_entry() -> dict | None:
         """Build a ParsedEntry from current accumulation state and return its dict."""
@@ -443,10 +544,16 @@ def parse_page(page_data: dict) -> Iterator[dict]:
         if current_entry_translit and definition.startswith(current_entry_translit):
             definition = definition[len(current_entry_translit):].lstrip(" ,;")
 
+        # Expand tilde shorthand before further processing
+        root_unvoweled = current_root.get("arabic_unvoweled", "")
+        definition = expand_tilde(definition, root_unvoweled)
+
         pos = _extract_pos(current_entry_spans)
         verb_form = _extract_verb_form(raw_text)
         plurals = _extract_plurals(raw_text)
         xrefs = _extract_xrefs(raw_text)
+        defs = split_definitions(definition.strip())
+        entry_type = _infer_entry_type(pos, verb_form, current_verb_form_section)
 
         entry = ParsedEntry(
             root_arabic=current_root["arabic"],
@@ -466,6 +573,9 @@ def parse_page(page_data: dict) -> Iterator[dict]:
             needs_review=False,
             raw_text=raw_text,
             warnings=[],
+            entry_type=entry_type,
+            parent_verb_form=current_verb_form_section,
+            definitions=defs,
         )
 
         # Cross-references stored as a separate key (not in ParsedEntry dataclass)
@@ -496,10 +606,20 @@ def parse_page(page_data: dict) -> Iterator[dict]:
     is_vision_page = page_data.get("source") == "vision_ocr"
 
     for span in spans:
+        # Verb form section headers (bold "II.", "III. …" through "X.") reset the
+        # section counter but don't start a new entry themselves.
+        if _is_verb_form_header(span):
+            m = _VERB_FORM_SECTION_RE.match(span.text)
+            if m:
+                current_verb_form_section = m.group(1).upper()
+            continue
+
         if _is_root_span(span):
             e = _flush_entry()
             if e:
                 yield e
+
+            current_verb_form_section = None  # new root resets the section
 
             # For Vision OCR: the span contains "[Arabic headword] [transliteration] [definition]"
             # all mixed together.  Split out the Arabic and Latin parts.

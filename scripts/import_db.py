@@ -127,9 +127,10 @@ def _insert_entry(conn: sqlite3.Connection, root_id: int, entry: dict) -> int | 
         """
         INSERT INTO entries (
             root_id, arabic, arabic_unvoweled, transliteration, transliteration_ascii,
-            part_of_speech, verb_form, plural_forms, definition,
+            part_of_speech, verb_form, entry_type, parent_verb_form,
+            plural_forms, definition,
             grammar_notes, page_number, confidence, needs_review
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             root_id,
@@ -139,6 +140,8 @@ def _insert_entry(conn: sqlite3.Connection, root_id: int, entry: dict) -> int | 
             translit_ascii,
             entry.get("part_of_speech") or None,
             entry.get("verb_form") or None,
+            entry.get("entry_type") or None,
+            entry.get("parent_verb_form") or None,
             plural_json,
             entry.get("definition", "") or "",
             entry.get("grammar_notes") or None,

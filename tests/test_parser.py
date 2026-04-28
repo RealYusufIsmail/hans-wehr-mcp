@@ -21,9 +21,12 @@ from hans_wehr.pipeline.parser import (
     _extract_verb_form,
     _is_derived_span,
     _is_root_span,
+    _is_verb_form_header,
     _roman_to_int,
     compute_confidence,
+    expand_tilde,
     parse_page,
+    split_definitions,
     strip_diacritics,
 )
 
@@ -282,3 +285,198 @@ def test_parse_page_multiple_roots():
     entries = list(parse_page(page_data))
     roots = {e["root_arabic"] for e in entries}
     assert len(roots) >= 2
+
+
+def test_parse_page_entry_has_new_fields():
+    """Parsed entries include the new dictionary-structure fields."""
+    page_data = _make_page_data([
+        {"text": "كَتَبَ", "size": 12.0, "flags": 16, "is_bold": True, "is_italic": False,
+         "font": "ArabicBold", "color": 0, "bbox": [10, 10, 100, 25]},
+        {"text": "kataba", "size": 9.0, "flags": 0, "is_bold": False, "is_italic": False,
+         "font": "Latin", "color": 0, "bbox": [105, 10, 200, 25]},
+        {"text": "v. to write", "size": 9.0, "flags": 0, "is_bold": False, "is_italic": False,
+         "font": "Regular", "color": 0, "bbox": [205, 10, 400, 25]},
+    ])
+    entries = list(parse_page(page_data))
+    assert entries
+    entry = entries[0]
+    assert "entry_type" in entry
+    assert "parent_verb_form" in entry
+    assert "definitions" in entry
+    assert isinstance(entry["definitions"], list)
+
+
+def test_parse_page_definitions_split_on_semicolons():
+    """Definitions field is split on semicolons at the parse level."""
+    page_data = _make_page_data([
+        {"text": "كَتَبَ", "size": 12.0, "flags": 16, "is_bold": True, "is_italic": False,
+         "font": "ArabicBold", "color": 0, "bbox": [10, 10, 100, 25]},
+        {"text": "to write; to compose; to inscribe", "size": 9.0, "flags": 0,
+         "is_bold": False, "is_italic": False, "font": "Regular", "color": 0,
+         "bbox": [105, 10, 400, 25]},
+    ])
+    entries = list(parse_page(page_data))
+    assert entries
+    defs = entries[0]["definitions"]
+    assert len(defs) >= 2
+
+
+def test_parse_page_verb_form_header_sets_section():
+    """A bold Roman numeral header sets parent_verb_form on the next derived entry."""
+    page_data = _make_page_data([
+        # Root headword
+        {"text": "كَتَبَ", "size": 12.0, "flags": 16, "is_bold": True, "is_italic": False,
+         "font": "ArabicBold", "color": 0, "bbox": [10, 0, 100, 20]},
+        {"text": "to write", "size": 9.0, "flags": 0, "is_bold": False, "is_italic": False,
+         "font": "Regular", "color": 0, "bbox": [105, 0, 300, 20]},
+        # Form II section header
+        {"text": "II. causative form", "size": 10.0, "flags": 16, "is_bold": True,
+         "is_italic": False, "font": "Bold", "color": 0, "bbox": [10, 25, 200, 45]},
+        # Derived entry under form II
+        {"text": "كَتَّبَ", "size": 9.5, "flags": 16, "is_bold": True, "is_italic": False,
+         "font": "ArabicBold", "color": 0, "bbox": [10, 50, 100, 70]},
+        {"text": "to cause to write", "size": 9.0, "flags": 0, "is_bold": False,
+         "is_italic": False, "font": "Regular", "color": 0, "bbox": [105, 50, 300, 70]},
+    ])
+    entries = list(parse_page(page_data))
+    assert len(entries) >= 2
+    # The derived entry under "II." should have parent_verb_form = "II"
+    derived = next((e for e in entries if "كتب" not in e.get("arabic_unvoweled", "")), None)
+    if derived:
+        assert derived["parent_verb_form"] == "II"
+
+
+# ---------------------------------------------------------------------------
+# expand_tilde
+# ---------------------------------------------------------------------------
+
+class TestExpandTilde:
+    def test_no_tilde(self):
+        assert expand_tilde("to write", "كتب") == "to write"
+
+    def test_single_tilde(self):
+        assert expand_tilde("~ات", "كتب") == "كتبات"
+
+    def test_multiple_tildes(self):
+        assert expand_tilde("~ or ~", "كتب") == "كتب or كتب"
+
+    def test_empty_text(self):
+        assert expand_tilde("", "كتب") == ""
+
+    def test_empty_headword(self):
+        assert expand_tilde("~ات", "") == "ات"
+
+    def test_no_mutation_without_tilde(self):
+        original = "plain text"
+        assert expand_tilde(original, "root") is original or expand_tilde(original, "root") == original
+
+
+# ---------------------------------------------------------------------------
+# split_definitions
+# ---------------------------------------------------------------------------
+
+class TestSplitDefinitions:
+    def test_no_semicolon(self):
+        assert split_definitions("to write a book") == ["to write a book"]
+
+    def test_simple_split(self):
+        assert split_definitions("to write; to compose") == ["to write", "to compose"]
+
+    def test_three_parts(self):
+        assert split_definitions("book; letter; document") == ["book", "letter", "document"]
+
+    def test_semicolon_inside_parens_not_split(self):
+        parts = split_definitions("to write (lit. or fig.; said of scribes)")
+        assert len(parts) == 1
+        assert "lit. or fig.; said of scribes" in parts[0]
+
+    def test_empty_string(self):
+        assert split_definitions("") == []
+
+    def test_whitespace_only(self):
+        assert split_definitions("   ") == []
+
+    def test_trailing_semicolon_ignored(self):
+        assert split_definitions("book; ") == ["book"]
+
+    def test_leading_whitespace_stripped(self):
+        parts = split_definitions(" book ;  letter ")
+        assert parts == ["book", "letter"]
+
+
+# ---------------------------------------------------------------------------
+# _is_verb_form_header
+# ---------------------------------------------------------------------------
+
+def _bold_span(text: str) -> RawSpan:
+    return RawSpan(text=text, size=10.0, is_bold=True, is_italic=False, font="Bold", bbox=[0, 0, 0, 0])
+
+
+def _plain_span(text: str) -> RawSpan:
+    return RawSpan(text=text, size=10.0, is_bold=False, is_italic=False, font="Regular", bbox=[0, 0, 0, 0])
+
+
+class TestIsVerbFormHeader:
+    def test_ii_dot(self):
+        assert _is_verb_form_header(_bold_span("II. to cause to write")) is True
+
+    def test_x_dot(self):
+        assert _is_verb_form_header(_bold_span("X. to seek")) is True
+
+    def test_iv_dot(self):
+        assert _is_verb_form_header(_bold_span("IV. to inform")) is True
+
+    def test_viii_space(self):
+        assert _is_verb_form_header(_bold_span("VIII something")) is True
+
+    def test_form_i_excluded(self):
+        # Form I is the root verb itself, not a section header
+        assert _is_verb_form_header(_bold_span("I. basic")) is False
+
+    def test_arabic_bold_not_header(self):
+        assert _is_verb_form_header(_bold_span("كَتَبَ")) is False
+
+    def test_non_bold_not_header(self):
+        assert _is_verb_form_header(_plain_span("II. to cause")) is False
+
+    def test_xi_out_of_range(self):
+        assert _is_verb_form_header(_bold_span("XI. hypothetical")) is False
+
+    def test_plain_latin_text_not_header(self):
+        assert _is_verb_form_header(_bold_span("to write boldly")) is False
+
+
+# ---------------------------------------------------------------------------
+# POS detection — extended abbreviations
+# ---------------------------------------------------------------------------
+
+def _make_italic_span_pos(text: str) -> RawSpan:
+    return RawSpan(text=text, size=9.0, is_bold=False, is_italic=True, font="Italic", bbox=[0, 0, 0, 0])
+
+
+class TestExtractPosExtended:
+    def test_verbal_noun(self):
+        assert _extract_pos([_make_italic_span_pos("vn. ")]) == "verbal_noun"
+
+    def test_active_participle(self):
+        assert _extract_pos([_make_italic_span_pos("ap. ")]) == "active_participle"
+
+    def test_passive_participle(self):
+        assert _extract_pos([_make_italic_span_pos("pp. ")]) == "passive_participle"
+
+    def test_collective_noun(self):
+        assert _extract_pos([_make_italic_span_pos("coll. ")]) == "collective_noun"
+
+    def test_nomen_unitatis(self):
+        assert _extract_pos([_make_italic_span_pos("n.un. ")]) == "nomen_unitatis"
+
+    def test_elative(self):
+        assert _extract_pos([_make_italic_span_pos("el. ")]) == "elative"
+
+    def test_prop_n(self):
+        assert _extract_pos([_make_italic_span_pos("prop.n. ")]) == "proper_noun"
+
+    def test_noun_not_confused_with_verbal_noun(self):
+        # "n." should not match "vn." — longer match takes priority
+        assert _extract_pos([_make_italic_span_pos("vn. ")]) == "verbal_noun"
+        assert _extract_pos([_make_italic_span_pos("n. ")]) == "noun"

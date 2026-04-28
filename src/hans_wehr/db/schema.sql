@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS entries (
     -- For verbs: Roman numeral form I–X (stored as text "I", "II", …, "X")
     verb_form           TEXT,
 
+    -- Semantic entry type (root_verb | verb_form | verbal_noun | active_participle |
+    -- passive_participle | collective_noun | nomen_unitatis | elative |
+    -- derived_noun | derived_adjective | derived_other | NULL = unknown)
+    entry_type          TEXT,
+
+    -- For derived forms: the verb form section (II–X) under which this entry appears
+    parent_verb_form    TEXT,
+
     -- JSON array of plural forms e.g. '["كُتُب","أَكْتَاب"]'
     -- NULL if not applicable (verbs, adjectives without broken plurals listed)
     plural_forms        TEXT,
@@ -294,3 +302,4 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+INSERT OR IGNORE INTO schema_version (version) VALUES (2);
