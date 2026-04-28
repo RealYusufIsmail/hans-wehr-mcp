@@ -62,6 +62,7 @@ hans-probe    = "scripts.probe_pdf:app"
 # Main pipeline commands (steps 1–4)
 hans-extract  = "hans_wehr.pipeline.extract:app"
 hans-ocr      = "scripts.ocr_pages:app"
+hans-ocr-rtf  = "scripts.parse_rtf:app"
 hans-verify-ocr = "scripts.verify_ocr:app"
 hans-parse    = "hans_wehr.pipeline.parser:app"
 hans-refine   = "hans_wehr.pipeline.llm_refine:app"
