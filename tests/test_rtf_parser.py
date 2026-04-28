@@ -23,7 +23,7 @@ import pytest
 
 from scripts.parse_rtf import (
     _infer_page_number,
-    _is_arabic_span,
+    detect_language,
     paragraphs_to_page_json,
     parse_rtf,
 )
@@ -187,27 +187,47 @@ class TestArabicUnicodeExpansion:
 
 
 # ---------------------------------------------------------------------------
-# _is_arabic_span
+# detect_language
 # ---------------------------------------------------------------------------
 
-class TestIsArabicSpan:
-    def test_pure_arabic(self):
-        assert _is_arabic_span("كتب") is True
+class TestDetectLanguage:
+    """detect_language() must return 'ar' or 'en' and never raise."""
 
-    def test_pure_latin(self):
-        assert _is_arabic_span("hello") is False
+    def test_pure_arabic_script(self):
+        assert detect_language("كتب") == "ar"
 
-    def test_mixed_mostly_arabic(self):
-        assert _is_arabic_span("كتب abc") is True
+    def test_pure_latin_word(self):
+        assert detect_language("hello") == "en"
 
-    def test_mixed_mostly_latin(self):
-        assert _is_arabic_span("kataba كتب word here") is False
+    def test_arabic_headword_with_translit(self):
+        # >30% Arabic chars → fast path, no library needed
+        assert detect_language("كتب kataba") == "ar"
 
-    def test_empty(self):
-        assert _is_arabic_span("") is False
+    def test_english_definition(self):
+        # Long enough for langdetect to identify as English
+        assert detect_language("to write a book or compose a letter") == "en"
+
+    def test_empty_string(self):
+        assert detect_language("") == "en"
+
+    def test_whitespace_only(self):
+        assert detect_language("   ") == "en"
 
     def test_digits_only(self):
-        assert _is_arabic_span("1234") is False
+        assert detect_language("1234") == "en"
+
+    def test_arabic_with_diacritics(self):
+        # Diacritical marks (U+064B-U+065F) are in the Arabic block
+        assert detect_language("كَتَبَ") == "ar"
+
+    def test_short_abbreviation_defaults_english(self):
+        # "n." is too short for langdetect; should default to 'en'
+        assert detect_language("n.") == "en"
+
+    def test_return_is_ar_or_en(self):
+        for text in ["كتب", "hello world", "", "kitāb", "مرحبا"]:
+            result = detect_language(text)
+            assert result in ("ar", "en"), f"Unexpected language code {result!r} for {text!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +284,42 @@ class TestParagraphsToPageJson:
         assert spans["كتب"]["is_arabic"] is True
         assert spans["kataba"]["is_arabic"] is False
 
+    def test_language_field_set(self):
+        result = paragraphs_to_page_json(self._sample_paras(), page_number=42)
+        spans = {
+            s["text"]: s
+            for b in result["blocks"]
+            for ln in b["lines"]
+            for s in ln["spans"]
+        }
+        assert spans["كتب"]["language"] == "ar"
+        assert spans["kataba"]["language"] == "en"
+
+    def test_column_set_by_language(self):
+        result = paragraphs_to_page_json(self._sample_paras(), page_number=42)
+        spans = {
+            s["text"]: s
+            for b in result["blocks"]
+            for ln in b["lines"]
+            for s in ln["spans"]
+        }
+        assert spans["كتب"]["column"] == "arabic"
+        assert spans["kataba"]["column"] == "english"
+
+    def test_column_values_are_arabic_or_english(self):
+        result = paragraphs_to_page_json(self._sample_paras(), page_number=42)
+        for b in result["blocks"]:
+            for ln in b["lines"]:
+                for s in ln["spans"]:
+                    assert s["column"] in ("arabic", "english")
+
+    def test_language_values_are_ar_or_en(self):
+        result = paragraphs_to_page_json(self._sample_paras(), page_number=42)
+        for b in result["blocks"]:
+            for ln in b["lines"]:
+                for s in ln["spans"]:
+                    assert s["language"] in ("ar", "en")
+
     def test_bbox_zeroed(self):
         result = paragraphs_to_page_json(self._sample_paras(), page_number=42)
         for block in result["blocks"]:
@@ -272,13 +328,6 @@ class TestParagraphsToPageJson:
                 assert line["bbox"] == [0.0, 0.0, 0.0, 0.0]
                 for span in line["spans"]:
                     assert span["bbox"] == [0.0, 0.0, 0.0, 0.0]
-
-    def test_column_is_empty_string(self):
-        result = paragraphs_to_page_json(self._sample_paras(), page_number=42)
-        for b in result["blocks"]:
-            for ln in b["lines"]:
-                for s in ln["spans"]:
-                    assert s["column"] == ""
 
     def test_flags_bitmask(self):
         result = paragraphs_to_page_json(self._sample_paras(), page_number=42)

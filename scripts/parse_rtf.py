@@ -57,6 +57,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import typer
 from rich.console import Console
@@ -70,8 +71,71 @@ console = Console()
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# RTF destination groups that should be skipped entirely.
-# These appear as  {\fonttbl ...}  or  {\* \xyz ...}.
+# Language detection
+# ---------------------------------------------------------------------------
+
+# Minimum character count before delegating to langdetect.
+# Below this threshold, single-word / abbreviation spans (e.g. "n.", "v.")
+# give unreliable results; we fall back to the Unicode heuristic.
+_MIN_DETECT_LEN: int = 10
+
+# langdetect is an optional dependency (part of the pipeline extras).
+# We bind a callable at import time so the rest of the code stays clean.
+_ld_detect: Callable[[str], str] | None = None
+try:
+    from langdetect import DetectorFactory
+    from langdetect import detect as _ld_detect_raw
+
+    DetectorFactory.seed = 0   # deterministic results across runs
+    _ld_detect = _ld_detect_raw
+    log.debug("langdetect loaded — language detection enabled")
+except ImportError:
+    log.debug(
+        "langdetect not installed; falling back to Unicode-range heuristic. "
+        "Install it with:  uv pip install hans-wehr-mcp[pipeline]"
+    )
+
+
+def detect_language(text: str) -> str:
+    """Detect whether *text* is primarily Arabic (``'ar'``) or English (``'en'``).
+
+    Detection strategy (fastest first):
+
+    1. **Empty string** → ``'en'`` (safe default).
+    2. **Arabic Unicode block** — if more than 30 % of the characters in *text*
+       fall in U+0600–U+06FF (the Arabic block), return ``'ar'`` immediately.
+       This handles headwords, vowelled text and Arabic-script numerals without
+       invoking the library.
+    3. **langdetect** — for Latin-script spans long enough for reliable
+       identification (≥ ``_MIN_DETECT_LEN`` chars).  Any language other than
+       ``'ar'`` is mapped to ``'en'`` since the Hans Wehr dictionary only
+       contains Arabic and English.
+    4. **Fallback** → ``'en'`` (Latin-script abbreviations, punctuation, etc.).
+
+    Never raises; exceptions from langdetect are silently swallowed.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return "en"
+
+    # Fast path: Arabic Unicode block U+0600–U+06FF.
+    # Count only alphabetic characters so spaces and Latin transliteration
+    # that follows an Arabic headword (e.g. "كتب kataba") don't dilute the
+    # ratio below the threshold.
+    letters = sum(1 for c in stripped if c.isalpha())
+    arabic_chars = sum(1 for c in stripped if "؀" <= c <= "ۿ")
+    if letters > 0 and arabic_chars / letters > 0.30:
+        return "ar"
+
+    # Library path: longer Latin-script spans only
+    if _ld_detect is not None and len(stripped) >= _MIN_DETECT_LEN:
+        try:
+            lang = _ld_detect(stripped)
+            return "ar" if lang == "ar" else "en"
+        except Exception:
+            pass
+
+    return "en"
 # ---------------------------------------------------------------------------
 _SKIP_DESTINATIONS = frozenset({
     "fonttbl", "colortbl", "stylesheet", "info", "expandedcolortbl",
@@ -292,24 +356,24 @@ def _expand_rtf_unicode(content: str) -> str:
 # Convert parsed paragraphs → pipeline page JSON
 # ---------------------------------------------------------------------------
 
-def _is_arabic_span(text: str) -> bool:
-    """True if more than 30% of letter characters are Arabic script."""
-    arabic = sum(1 for c in text if "؀" <= c <= "ۿ")
-    letters = sum(1 for c in text if c.isalpha())
-    return letters > 0 and arabic / letters > 0.30
-
-
 def paragraphs_to_page_json(
     paragraphs: list[list[dict]],
     page_number: int,
 ) -> dict:
     """Convert RTF paragraphs to the pipeline page_NNNN.json schema.
 
+    Each span is language-tagged via :func:`detect_language` so that the
+    ``column`` field mirrors the Vision OCR convention (``"arabic"`` /
+    ``"english"``).  The explicit ``language`` field (``"ar"`` / ``"en"``) is
+    added as pipeline metadata.
+
     Key differences from Vision OCR JSON:
-    - ``font`` is ``"rtf-ocr"`` (not ``"vision-ocr"``), so ``RawSpan.is_vision``
-      is False and the parser uses bold-flag headword detection instead of
-      column-position heuristics.
-    - ``is_bold`` and ``is_italic`` are set from RTF formatting.
+
+    - ``font`` is ``"rtf-ocr"`` (not ``"vision-ocr"``), so
+      ``RawSpan.is_vision`` is False and the parser uses the bold-flag
+      headword detection path instead of column-position heuristics.
+    - ``is_bold`` and ``is_italic`` are set from actual RTF formatting —
+      the main accuracy gain over the Vision API path.
     - ``bbox`` is zeroed — RTF carries no spatial information.
     - Confidence is NOT capped at 0.60 (that cap is only for Vision OCR).
     """
@@ -322,6 +386,7 @@ def paragraphs_to_page_json(
                 continue
             is_bold = raw["is_bold"]
             is_italic = raw["is_italic"]
+            lang = detect_language(text)
             spans_out.append({
                 "text": text,
                 "font": "rtf-ocr",
@@ -329,8 +394,9 @@ def paragraphs_to_page_json(
                 "flags": (16 if is_bold else 0) | (2 if is_italic else 0),
                 "is_bold": is_bold,
                 "is_italic": is_italic,
-                "is_arabic": _is_arabic_span(text),
-                "column": "",          # no spatial column info in RTF
+                "is_arabic": lang == "ar",
+                "language": lang,
+                "column": "arabic" if lang == "ar" else "english",
                 "color": 0,
                 "bbox": [0.0, 0.0, 0.0, 0.0],
             })
